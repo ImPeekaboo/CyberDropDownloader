@@ -1,0 +1,44 @@
+name: Build Executable Binary
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install -U pip
+        pip install -U poetry
+        pip install -U pyinstaller
+
+    - name: Build executable
+      run: |
+        poetry install
+        cd cyberdrop_dl
+        pyinstaller --onefile \
+            main.py
+        cp dist/main* ../cyberdrop-dl
+
+    - name: Compressing
+      run: |
+        tar -czvf linux-x64.tar.gz cyberdrop-dl
+
+    - name: Upload Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: linux-x64.tar.gz
+        prerelease: false
