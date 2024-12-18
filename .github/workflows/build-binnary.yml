@@ -27,7 +27,8 @@ jobs:
 
     - name: Build executable
       run: |
-        poetry install --no-venv
+        poetry config virtualenvs.create false
+        poetry install --no-interaction
         cd cyberdrop_dl
         pyinstaller --onefile \
             main.py
