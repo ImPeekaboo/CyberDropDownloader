@@ -59,9 +59,9 @@ class Sorter:
                 return True
             for auto_index in itertools.count(1):
                 new_filename = f"{new_path.stem}{self.incrementer_format.format(i=auto_index)}{new_path.suffix}"
-                new_path = new_path.parent / new_filename
-                if not new_path.is_file():
-                    old_path.rename(new_path)
+                possible_new_path = new_path.parent / new_filename
+                if not possible_new_path.is_file():
+                    old_path.rename(possible_new_path)
                     break
         except OSError:
             return False
@@ -154,6 +154,7 @@ class Sorter:
         """Sorts a video file into the sorted video folder."""
         if not self.video_format:
             return
+
         codec = duration = fps = height = resolution = width = None
 
         with contextlib.suppress(RuntimeError, CalledProcessError):
@@ -165,7 +166,11 @@ class Sorter:
 
             codec = props.get("codec_name")
             duration = int(float(props.get("duration", 0))) or None
-            fps = float(Fraction(props.get("avg_frame_rate", 0))) or None
+            fps = (
+                float(Fraction(props.get("avg_frame_rate", 0)))
+                if str(props.get("avg_frame_rate", 0)) not in {"0/0", "0"}
+                else None
+            )
             if fps:
                 fps = int(fps) if fps.is_integer() else f"{fps:.2f}"
 

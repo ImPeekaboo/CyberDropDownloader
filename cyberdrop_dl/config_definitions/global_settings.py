@@ -1,14 +1,14 @@
-import re
 from datetime import timedelta
 
 from pydantic import BaseModel, ByteSize, Field, NonNegativeFloat, PositiveInt, field_serializer, field_validator
 from yarl import URL
 
-from .custom_types import AliasModel, HttpURL, NonEmptyStr
+from cyberdrop_dl.config_definitions.pydantic.validators import parse_duration_to_timedelta
 
-DATE_PATTERN = re.compile(
-    r"(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)", re.IGNORECASE
-)
+from .pydantic.custom_types import AliasModel, HttpURL, NonEmptyStr
+
+MIN_REQUIRED_FREE_SPACE = ByteSize._validate("512MB", "")
+DEFAULT_REQUIRED_FREE_SPACE = ByteSize._validate("5GB", "")
 
 
 def convert_to_str(value: URL | str) -> str | None:
@@ -26,7 +26,7 @@ class General(BaseModel):
     flaresolverr: HttpURL | None = None
     max_file_name_length: PositiveInt = 95
     max_folder_name_length: PositiveInt = 60
-    required_free_space: ByteSize = ByteSize._validate("5GB", "")
+    required_free_space: ByteSize = Field(DEFAULT_REQUIRED_FREE_SPACE, ge=MIN_REQUIRED_FREE_SPACE)
 
     @field_serializer("required_free_space")
     def human_readable(self, value: ByteSize | int) -> str:
@@ -74,39 +74,7 @@ class RateLimitingOptions(BaseModel):
 
         for `int`, value is assummed as `days`
         """
-        if not input_date:
-            return 0
-        parsed_timedelta = input_date
-        if isinstance(input_date, int):
-            parsed_timedelta = timedelta(days=input_date)
-        if isinstance(input_date, str):
-            time_str = input_date.casefold()
-            matches: list[str] = re.findall(DATE_PATTERN, time_str)
-            seen_units = set()
-            time_dict = {"days": 0}
-
-            for value, unit in matches:
-                value = int(value)
-                unit = unit.lower()
-                normalized_unit = unit.rstrip("s")
-                plural_unit = normalized_unit + "s"
-                if normalized_unit in seen_units:
-                    raise ValueError(f"Duplicate time unit detected: '{unit}' conflicts with another entry.")
-                seen_units.add(normalized_unit)
-
-                if "day" in unit:
-                    time_dict["days"] += value
-                elif "month" in unit:
-                    time_dict["days"] += value * 30
-                elif "year" in unit:
-                    time_dict["days"] += value * 365
-                else:
-                    time_dict[plural_unit] = value
-
-            if matches:
-                parsed_timedelta = timedelta(**time_dict)
-
-        return parsed_timedelta
+        return parse_duration_to_timedelta(input_date)
 
 
 class UIOptions(BaseModel):

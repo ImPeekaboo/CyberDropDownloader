@@ -4,10 +4,11 @@ import asyncio
 import copy
 from abc import ABC, abstractmethod
 from dataclasses import field
+from datetime import datetime
 from functools import wraps
-from http.cookiejar import MozillaCookieJar
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
+from aiolimiter import AsyncLimiter
 from bs4 import BeautifulSoup
 from yarl import URL
 
@@ -26,17 +27,28 @@ if TYPE_CHECKING:
     from cyberdrop_dl.managers.manager import Manager
 
 
+class Post(Protocol):
+    number: int
+    id: str
+    title: str
+    date: datetime | int
+
+
 class Crawler(ABC):
     SUPPORTED_SITES: ClassVar[dict[str, list]] = {}
     domain = None
     primary_base_domain: URL = None
+    DEFAULT_POST_TITLE_FORMAT = "{date} - {number} - {title}"
 
     def __init__(self, manager: Manager, domain: str, folder_domain: str | None = None) -> None:
         self.manager = manager
         self.downloader = field(init=False)
         self.scraping_progress = manager.progress_manager.scraping_progress
         self.client: ScraperClient = field(init=False)
-        self._lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(20)
+        self.startup_lock = asyncio.Lock()
+        self.request_limiter = AsyncLimiter(10, 1)
+        self.ready: bool = False
 
         self.domain = domain
         self.folder_domain = folder_domain or domain.capitalize()
@@ -46,31 +58,25 @@ class Crawler(ABC):
         self.scraped_items: list = []
         self.waiting_items = 0
 
-    def startup(self) -> None:
+    async def startup(self) -> None:
         """Starts the crawler."""
-        self.client = self.manager.client_manager.scraper_session
-        self.downloader = Downloader(self.manager, self.domain)
-        self.cookiejar_file = self.manager.path_manager.cookies_dir / f"{self.primary_base_domain.host}.txt"
-        if self.cookiejar_file.is_file():
-            log(f"Found cookie file for: {self.domain}", 10)
-            try:
-                cookie_jar = MozillaCookieJar(self.cookiejar_file)
-                cookie_jar.load(ignore_discard=True)
-                for cookie in cookie_jar:
-                    self.manager.client_manager.cookies.update_cookies(
-                        {cookie.name: cookie.value}, response_url=URL(f"https://{cookie.domain}")
-                    )
-            except Exception:
-                log(f"Unable to apply cookies from {self.cookiejar_file}", 10, exc_info=True)
+        async with self.startup_lock:
+            if self.ready:
+                return
+            self.client = self.manager.client_manager.scraper_session
+            self.downloader = Downloader(self.manager, self.domain)
+            self.downloader.startup()
+            await self.async_startup()
+            self.ready = True
 
-        self.downloader.startup()
+    async def async_startup(self) -> None: ...  # noqa: B027
 
     async def run(self, item: ScrapeItem) -> None:
         """Runs the crawler loop."""
         if not item.url.host:
             return
         self.waiting_items += 1
-        async with self._lock:
+        async with self._semaphore:
             self.waiting_items -= 1
             if item.url.path_qs not in self.scraped_items:
                 log(f"Scraping: {item.url}", 20)
@@ -93,6 +99,7 @@ class Crawler(ABC):
         scrape_item: ScrapeItem,
         filename: str,
         ext: str,
+        *,
         custom_filename: str | None = None,
         debrid_link: URL | None = None,
     ) -> None:
@@ -113,8 +120,6 @@ class Crawler(ABC):
             original_filename,
             debrid_link,
         )
-        if scrape_item.possible_datetime:
-            media_item.datetime = scrape_item.possible_datetime
 
         check_complete = await self.manager.db_manager.history_table.check_complete(self.domain, url, scrape_item.url)
         if check_complete:
@@ -244,7 +249,7 @@ class Crawler(ABC):
             return True
         return False
 
-    async def get_album_results(self, album_id: str) -> bool | dict[Any, Any]:
+    async def get_album_results(self, album_id: str) -> dict[Any, Any]:
         """Checks whether an album has completed given its domain and album id."""
         return await self.manager.db_manager.history_table.check_album(self.domain, album_id)
 
@@ -297,8 +302,40 @@ class Crawler(ABC):
 
         return title
 
+    def add_separate_post_title(self, scrape_item: ScrapeItem, post: Post) -> None:
+        if not self.manager.config_manager.settings_data.download_options.separate_posts:
+            return
+        title_format = self.manager.config_manager.settings_data.download_options.separate_posts_format
+        if title_format.casefold() == "{default}":
+            title_format = self.DEFAULT_POST_TITLE_FORMAT
+        date = post.date
+        if isinstance(post.date, int):
+            date = datetime.fromtimestamp(date)
+        if isinstance(date, datetime):
+            date = date.isoformat()
+        id = "Unknown" if post.id is None else post.id
+        title = "Untitled" if post.title is None else post.title
+        date = "NO_DATE" if date is None else date
+        title = title_format.format(id=id, number=id, date=date, title=title)
+        scrape_item.add_to_parent_title(title)
 
-def create_task_id(func: Callable) -> None:
+    def parse_url(self, link_str: str, relative_to: URL | None = None) -> URL:
+        assert link_str
+        assert isinstance(link_str, str)
+        encoded = "%" in link_str
+        base = relative_to or self.primary_base_domain
+        if link_str.startswith("?"):
+            link = base.with_query(link_str[1:])
+        elif link_str.startswith("//"):
+            link = URL("https:" + link_str, encoded=encoded)
+        elif link_str.startswith("/"):
+            link = base.joinpath(link_str[1:], encoded=encoded)
+        else:
+            link = URL(link_str, encoded=encoded)
+        return link
+
+
+def create_task_id(func: Callable) -> Callable:
     """Wrapper handles task_id creation and removal for ScrapeItems"""
 
     @wraps(func)

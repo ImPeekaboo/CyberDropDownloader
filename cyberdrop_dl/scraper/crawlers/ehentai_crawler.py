@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 import calendar
-import contextlib
 import datetime
 from typing import TYPE_CHECKING
 
-from aiolimiter import AsyncLimiter
 from yarl import URL
 
-from cyberdrop_dl.clients.errors import MaxChildrenError
-from cyberdrop_dl.scraper.crawler import Crawler
+from cyberdrop_dl.scraper.crawler import Crawler, create_task_id
 from cyberdrop_dl.utils.data_enums_classes.url_objects import FILE_HOST_ALBUM, ScrapeItem
 from cyberdrop_dl.utils.logger import log
 from cyberdrop_dl.utils.utilities import error_handling_wrapper, get_filename_and_ext
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from bs4 import BeautifulSoup
 
     from cyberdrop_dl.managers.manager import Manager
@@ -25,71 +24,55 @@ class EHentaiCrawler(Crawler):
 
     def __init__(self, manager: Manager) -> None:
         super().__init__(manager, "e-hentai", "E-Hentai")
-        self.request_limiter = AsyncLimiter(10, 1)
-        self.warnings_set = False
+
+        self._warnings_set = False
+        self.next_page_selector = "td[onclick='document.location=this.firstChild.href']:contains('>') a"
+        self.next_page_attribute = "href"
 
     """~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"""
 
+    @create_task_id
     async def fetch(self, scrape_item: ScrapeItem) -> None:
         """Determines where to send the scrape item based on the url."""
-        task_id = self.scraping_progress.add_task(scrape_item.url)
-
         if "g" in scrape_item.url.parts:
-            if not self.warnings_set:
-                await self.set_no_warnings(scrape_item)
             await self.album(scrape_item)
         elif "s" in scrape_item.url.parts:
             await self.image(scrape_item)
         else:
             log(f"Scrape Failed: Unknown URL Path for {scrape_item.url}", 40)
-            self.manager.progress_manager.scrape_stats_progress.add_failure("Unsupported Link")
-
-        self.scraping_progress.remove_task(task_id)
 
     @error_handling_wrapper
     async def album(self, scrape_item: ScrapeItem) -> None:
         """Scrapes an album."""
-        async with self.request_limiter:
-            soup: BeautifulSoup = await self.client.get_soup(self.domain, scrape_item.url, origin=scrape_item)
+        if not self._warnings_set:
+            await self.set_no_warnings(scrape_item)
 
-        title = self.create_title(soup.select_one("h1[id=gn]").get_text(), None, None)
-        date = self.parse_datetime(soup.select_one("td[class=gdt2]").get_text())
-        scrape_item.type = FILE_HOST_ALBUM
-        scrape_item.children = scrape_item.children_limit = 0
+        title = date = None
+        gallery_id = scrape_item.url.parts[2]
+        scrape_item.url = scrape_item.url.with_query(None)
+        scrape_item.set_type(FILE_HOST_ALBUM, self.manager)
 
-        with contextlib.suppress(IndexError, TypeError):
-            scrape_item.children_limit = (
-                self.manager.config_manager.settings_data.download_options.maximum_number_of_children[scrape_item.type]
-            )
+        async for soup in self.web_pager(scrape_item):
+            if not title:
+                title = self.create_title(soup.select_one("h1[id=gn]").get_text())
+                date = self.parse_datetime(soup.select_one("td[class=gdt2]").get_text())
 
-        images = soup.select("div[class=gdtm] div a")
-        for image in images:
-            link = URL(image.get("href"))
-            new_scrape_item = self.create_scrape_item(
-                scrape_item,
-                link,
-                title,
-                True,
-                None,
-                date,
-                add_parent=scrape_item.url,
-            )
-            self.manager.task_group.create_task(self.run(new_scrape_item))
-            scrape_item.children += 1
-            if scrape_item.children_limit and scrape_item.children >= scrape_item.children_limit:
-                raise MaxChildrenError(origin=scrape_item)
+            images = soup.select("div#gdt.gt200 a")
+            for image in images:
+                link_str: str = image.get("href")
+                link = self.parse_url(link_str)
+                new_scrape_item = self.create_scrape_item(
+                    scrape_item,
+                    link,
+                    title,
+                    part_of_album=True,
+                    album_id=gallery_id,
+                    possible_datetime=date,
+                    add_parent=scrape_item.url,
+                )
 
-        next_page_opts = soup.select('td[onclick="document.location=this.firstChild.href"]')
-        next_page = None
-        for maybe_next in next_page_opts:
-            if maybe_next.get_text() == ">":
-                next_page = maybe_next.select_one("a")
-                break
-        if next_page is not None:
-            next_page = URL(next_page.get("href"))
-            if next_page is not None:
-                new_scrape_item = self.create_scrape_item(scrape_item, next_page, "")
-                self.manager.task_group.create_task(self.run(new_scrape_item))
+                await self.image(new_scrape_item)
+                scrape_item.add_children()
 
     @error_handling_wrapper
     async def image(self, scrape_item: ScrapeItem) -> None:
@@ -99,25 +82,41 @@ class EHentaiCrawler(Crawler):
 
         async with self.request_limiter:
             soup: BeautifulSoup = await self.client.get_soup(self.domain, scrape_item.url, origin=scrape_item)
+
         image = soup.select_one("img[id=img]")
-        link = URL(image.get("src"))
+        link_str: str = image.get("src")
+        link = self.parse_url(link_str)
         filename, ext = get_filename_and_ext(link.name)
-        await self.handle_file(link, scrape_item, filename, ext)
+        custom_filename, _ = get_filename_and_ext(f"{scrape_item.url.name}{ext}")
+        await self.handle_file(link, scrape_item, filename, ext, custom_filename=custom_filename)
 
     """~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"""
 
     @error_handling_wrapper
     async def set_no_warnings(self, scrape_item: ScrapeItem) -> None:
         """Sets the no warnings cookie."""
-        self.warnings_set = True
         async with self.request_limiter:
-            scrape_item.url = URL(str(scrape_item.url) + "/").update_query("nw=session")
-            await self.client.get_soup(self.domain, scrape_item.url, origin=scrape_item)
+            url = scrape_item.url.update_query(nw="session")
+            await self.client.get_soup(self.domain, url, origin=scrape_item)
+        self._warnings_set = True
 
     @staticmethod
     def parse_datetime(date: str) -> int:
         """Parses a datetime string into a unix timestamp."""
         if date.count(":") == 1:
             date = date + ":00"
-        date = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S")
-        return calendar.timegm(date.timetuple())
+        parsed_date = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S")
+        return calendar.timegm(parsed_date.timetuple())
+
+    async def web_pager(self, scrape_item: ScrapeItem) -> AsyncGenerator[BeautifulSoup]:
+        """Generator of website pages."""
+        page_url = scrape_item.url
+        while True:
+            async with self.request_limiter:
+                soup: BeautifulSoup = await self.client.get_soup(self.domain, page_url, origin=scrape_item)
+            next_page = soup.select_one(self.next_page_selector)
+            yield soup
+            if not next_page:
+                break
+            page_url_str: str = next_page.get(self.next_page_attribute)
+            page_url = self.parse_url(page_url_str)

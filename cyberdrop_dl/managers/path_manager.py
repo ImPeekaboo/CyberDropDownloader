@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cyberdrop_dl.utils import constants
+from cyberdrop_dl.utils.utilities import purge_dir_tree
 
 if TYPE_CHECKING:
     from cyberdrop_dl.managers.manager import Manager
@@ -35,10 +36,10 @@ class PathManager:
         self.history_db: Path = field(init=False)
         self.cache_db: Path = field(init=False)
 
-        self._completed_downloads: list[MediaItem] = []
-        self._completed_downloads_set = set()
-        self._prev_downloads: list[MediaItem] = []
-        self._prev_downloads_set = set()
+        self._completed_downloads: set[MediaItem] = set()
+        self._completed_downloads_paths: set[Path] = set()
+        self._prev_downloads: set[MediaItem] = set()
+        self._prev_downloads_paths: set[Path] = set()
 
         self.main_log: Path = field(init=False)
         self.last_forum_post_log: Path = field(init=False)
@@ -84,16 +85,20 @@ class PathManager:
         self.input_file = self.replace_config_in_path(settings_data.files.input_file)
         self.history_db = self.cache_folder / "cyberdrop.db"
 
-        self._set_output_filenames()
         self.log_folder.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now()
+        self._set_output_filenames(now)
+        self._delete_logs_and_folders(now)
         self._create_output_folders()
 
         if not self.input_file.is_file():
             self.input_file.touch(exist_ok=True)
         self.history_db.touch(exist_ok=True)
 
-    def _set_output_filenames(self) -> None:
-        current_time_iso = datetime.now().strftime("%Y%m%d_%H%M%S")
+    def _set_output_filenames(self, now) -> None:
+        current_time_file_iso = now.strftime("%Y%m%d_%H%M%S")
+        current_time_folder_iso = now.strftime("%Y_%m_%d")
         log_settings_config = self.manager.config_manager.settings_data.logs
         log_files: dict[str, Path] = log_settings_config.model_dump()
 
@@ -101,7 +106,11 @@ class PathManager:
             if model_name not in self._logs_model_names:
                 continue
             if log_settings_config.rotate_logs:
-                log_file = log_file.parent / f"{log_file.stem}__{current_time_iso}{log_file.suffix}"
+                log_file = (
+                    log_file.parent
+                    / current_time_folder_iso
+                    / f"{log_file.stem}_{current_time_file_iso}{log_file.suffix}"
+                )
             log_files[model_name] = log_file
 
         log_settings_config = log_settings_config.model_copy(update=log_files)
@@ -110,6 +119,15 @@ class PathManager:
             internal_name = f"{model_name.replace('_log','')}_log"
             setattr(self, internal_name, self.log_folder / getattr(log_settings_config, model_name))
 
+    def _delete_logs_and_folders(self, now):
+        if self.manager.config_manager.settings_data.logs.logs_expire_after:
+            for file in set(self.log_folder.rglob("*.log")) | set(self.log_folder.rglob("*.csv")):
+                if (
+                    now - datetime.fromtimestamp(Path(file).stat().st_ctime)
+                ) > self.manager.config_manager.settings_data.logs.logs_expire_after:
+                    file.unlink(missing_ok=True)
+        purge_dir_tree(self.log_folder)
+
     def _create_output_folders(self):
         for model_name in self._logs_model_names:
             internal_name = f"{model_name.replace('_log','')}_log"
@@ -117,14 +135,12 @@ class PathManager:
             path.parent.mkdir(parents=True, exist_ok=True)
 
     def add_completed(self, media_item: MediaItem) -> None:
-        if media_item.complete_file.absolute() not in self._completed_downloads_set:
-            self._completed_downloads.append(media_item)
-            self._completed_downloads_set.add(media_item.complete_file.absolute())
+        self._completed_downloads.add(media_item)
+        self._completed_downloads_paths.add(media_item.complete_file.resolve())
 
     def add_prev(self, media_item: MediaItem) -> None:
-        if media_item.complete_file.absolute() not in self._prev_downloads_set:
-            self._prev_downloads.append(media_item)
-            self._prev_downloads_set.add(media_item.complete_file.absolute())
+        self._prev_downloads.add(media_item)
+        self._prev_downloads_paths.add(media_item.complete_file.resolve())
 
     @property
     def completed_downloads(self) -> set[MediaItem]:

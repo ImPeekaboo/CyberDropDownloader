@@ -6,15 +6,14 @@ from typing import TYPE_CHECKING
 
 from yarl import URL
 
+from cyberdrop_dl.utils.constants import VALIDATION_ERROR_FOOTER
+
 if TYPE_CHECKING:
+    from requests import Response
     from yaml.constructor import ConstructorError
 
     from cyberdrop_dl.scraper.crawler import ScrapeItem
     from cyberdrop_dl.utils.data_enums_classes.url_objects import MediaItem
-
-VALIDATION_ERROR_FOOTER = """
-Read the documentation for guidance on how to resolve this error: https://script-ware.gitbook.io/cyberdrop-dl/reference/configuration-options
-Please note, this is not a bug. Do not open issues related to this"""
 
 
 class CDLBaseError(Exception):
@@ -54,7 +53,7 @@ class NoExtensionError(CDLBaseError):
 
 
 class PasswordProtectedError(CDLBaseError):
-    def __init__(self, *, message: str | None = None, origin: ScrapeItem | MediaItem | URL | None = None) -> None:
+    def __init__(self, message: str | None = None, *, origin: ScrapeItem | MediaItem | URL | None = None) -> None:
         """This error will be thrown when a file is password protected."""
         ui_message = "Password Protected"
         message = message or "File/Folder is password protected"
@@ -62,7 +61,7 @@ class PasswordProtectedError(CDLBaseError):
 
 
 class MaxChildrenError(CDLBaseError):
-    def __init__(self, *, message: str | None = None, origin: ScrapeItem | MediaItem | URL | None = None) -> None:
+    def __init__(self, message: str | None = None, *, origin: ScrapeItem | MediaItem | URL | None = None) -> None:
         """This error will be thrown when an scrape item reaches its max number or children."""
         ui_message = "Max Children Reached"
         message = message or "Max number of children reached"
@@ -70,7 +69,7 @@ class MaxChildrenError(CDLBaseError):
 
 
 class DDOSGuardError(CDLBaseError):
-    def __init__(self, *, message: str | None = None, origin: ScrapeItem | MediaItem | URL | None = None) -> None:
+    def __init__(self, message: str | None = None, *, origin: ScrapeItem | MediaItem | URL | None = None) -> None:
         """This error will be thrown when DDoS-Guard is detected."""
         ui_message = "DDoS-Guard"
         message = message or "DDoS-Guard detected"
@@ -105,6 +104,39 @@ class RestrictedFiletypeError(CDLBaseError):
         super().__init__(ui_message, origin=origin)
 
 
+class MediaFireError(CDLBaseError):
+    def __init__(
+        self, status: str | int, message: str | None = None, origin: ScrapeItem | MediaItem | URL | None = None
+    ) -> None:
+        """This error will be thrown when a scrape fails."""
+        ui_message = f"{status} MediaFire Error"
+        super().__init__(ui_message, message=message, status=status, origin=origin)
+
+
+class RealDebridError(CDLBaseError):
+    """Base RealDebrid API error."""
+
+    def __init__(self, response: Response, error_codes: dict[int, str]) -> None:
+        url = URL(response.url)
+        self.path = url.path
+        try:
+            JSONResp: dict = response.json()
+            code = JSONResp.get("error_code")
+            if code == 16:
+                code = 7
+            error = error_codes.get(code, "Unknown error")
+
+        except AttributeError:
+            code = response.status_code
+            error = f"{code} - {HTTPStatus(code).phrase}"
+
+        error = error.capitalize()
+
+        """This error will be thrown when a scrape fails."""
+        ui_message = f"{code} RealDebrid Error"
+        super().__init__(ui_message, message=error, status=code, origin=url)
+
+
 class ScrapeError(CDLBaseError):
     def __init__(
         self, status: str | int, message: str | None = None, origin: ScrapeItem | MediaItem | URL | None = None
@@ -120,7 +152,7 @@ class ScrapeError(CDLBaseError):
 
 
 class LoginError(CDLBaseError):
-    def __init__(self, *, message: str | None = None, origin: ScrapeItem | MediaItem | URL | None = None) -> None:
+    def __init__(self, message: str | None = None, *, origin: ScrapeItem | MediaItem | URL | None = None) -> None:
         """This error will be thrown when the login fails for a site."""
         ui_message = "Failed Login"
         super().__init__(ui_message, message=message, origin=origin)
